@@ -31,6 +31,15 @@ DEFAULT_URLS = {
 
 GOLD_CODES = {"gold_ounce", "gold21", "gold18"}
 
+# التسمية التي يُبحث عنها بصفحة الذهب لكل كود — شاهدنا فعلياً (لقطة شاشة من sp-today.com)
+# أن الصفحة تعرض كل العيارات معاً (24K/22K/21K/18K/14K + Ounce) بغض النظر عن الرابط المحدد،
+# لذلك نربط كل كود بتسمية مميزة بدل الاعتماد على أول رقم دولار بالصفحة.
+GOLD_LABELS = {
+    "gold_ounce": "Ounce",
+    "gold21": "21K",
+    "gold18": "18K",
+}
+
 SITE_URL = os.environ.get("SITE_URL")
 TOKEN = os.environ.get("TOKEN")
 CURRENCIES_ENV = os.environ.get("CURRENCIES", "").strip()
@@ -82,23 +91,34 @@ def parse_buy_sell(html: str):
     return m.group(1).replace(",", ""), m.group(2).replace(",", "")
 
 
-def parse_single_price(html: str):
-    """لصفحات الذهب: سعر واحد فقط. نجرب عدة أنماط شائعة، وإن فشلت نأخذ أول رقم كبير معقول كاحتياط."""
+def parse_gold_label(html: str, label: str):
+    """
+    صفحة الذهب على sp-today.com تعرض كل العيارات معاً (24K/22K/21K/18K/14K)
+    بالإضافة لسعر الأونصة بأعلى الصفحة، بصرف النظر عن أي رابط فرعي استُخدم.
+    لذلك نبحث عن التسمية المحددة (مثل "21K" أو "Ounce") ثم نلتقط أول سعر
+    دولار يظهر بعدها *ضمن مسافة قصيرة* فقط — هذا يمنع القفز لقيمة عيار آخر
+    أو لعنصر غير متعلق أبداً بالسعر (كما حصل سابقاً مع أول رقم بالصفحة).
+
+    للعيارات (21K/18K): الشكل "21K ▲0.00% Sell $117.00 Buy $115.00" — نأخذ
+    قيمة Sell. للأونصة: الشكل "Ounce $4143.65" — نأخذ الرقم مباشرة بعد الكلمة.
+    """
     text = clean_text(html)
 
-    m = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:new\s+)?SYP", text, re.I)
+    if label.lower() == "ounce":
+        m = re.search(r"Ounce\s*\$\s*([\d,]+(?:\.\d+)?)", text, re.I)
+        if m:
+            return m.group(1).replace(",", "")
+        return None
+
+    # نافذة محدودة (80 حرف) بعد التسمية — كافية لتصل لكلمة Sell الخاصة بنفس
+    # البطاقة، لكنها قصيرة بما يكفي لعدم الانزلاق لبطاقة عيار مختلف إن لم يُعثر
+    # على Sell قريباً (عندها يفشل هذا الموضع ويجرب المحرك ظهور التسمية التالي
+    # لنفس النص، كما بأعلى الصفحة حيث "21K" تظهر أيضاً بقسم الأسعار المحلية
+    # بالليرة السورية بدون كلمة Sell قريبة منها فلا تُطابَق هناك خطأً).
+    pattern = re.escape(label) + r".{0,80}?Sell\s*\$\s*([\d,]+(?:\.\d+)?)"
+    m = re.search(pattern, text, re.I | re.S)
     if m:
         return m.group(1).replace(",", "")
-
-    m = re.search(r"price[^\d]{0,15}([\d,]{4,}(?:\.\d+)?)", text, re.I)
-    if m:
-        return m.group(1).replace(",", "")
-
-    # احتياطي أخير: أول رقم بأربع خانات فأكثر (سعر بالليرة السورية عادة كبير)
-    m = re.search(r"([\d,]{4,}(?:\.\d+)?)", text)
-    if m:
-        return m.group(1).replace(",", "")
-
     return None
 
 
@@ -120,32 +140,60 @@ def main():
     currencies = parse_currencies_env(CURRENCIES_ENV)
     had_error = False
 
+    # -------- المرحلة 1: نجلب ونحلل كل شي أولاً بدون إرسال أي شيء للموقع --------
+    fx_results = {}    # code -> (buy, sell)
+    gold_results = {}  # code -> price
     for code, url in currencies.items():
         try:
             html = fetch_html(url)
-            is_gold = code in GOLD_CODES
-
-            if is_gold:
-                price = parse_single_price(html)
+            if code in GOLD_CODES:
+                label = GOLD_LABELS.get(code, code)
+                price = parse_gold_label(html, label)
                 if not price:
-                    print(f"ERROR: could not parse gold price for '{code}' from {url}", file=sys.stderr)
+                    print(f"ERROR: could not parse gold price for '{code}' (label '{label}') from {url}", file=sys.stderr)
                     had_error = True
                     continue
-                print(f"[{code}] parsed -> price: {price}")
-                result = push_to_site(code, None, price)
+                gold_results[code] = price
             else:
                 rate = parse_buy_sell(html)
                 if not rate:
                     print(f"ERROR: could not parse rate for '{code}' from {url}", file=sys.stderr)
                     had_error = True
                     continue
-                buy, sell = rate
-                print(f"[{code}] parsed -> buy: {buy}  sell: {sell}")
-                result = push_to_site(code, buy, sell)
+                fx_results[code] = rate
+        except Exception as e:
+            print(f"ERROR fetching '{code}': {e}", file=sys.stderr)
+            had_error = True
 
+    # -------- المرحلة 2: شبكة أمان للذهب — إذا تطابق أي سعرين، لا نرسل أي سعر ذهب إطلاقاً --------
+    # (ذهب الأونصة يختلف رقمياً بشكل كبير عن سعر الغرام الواحد، فتطابق أي قيمتين يعني خطأ تحليل
+    # وليس سعراً حقيقياً — رأينا هذا يحدث فعلياً حين يُنتزع رقم من عنصر مشترك بقالب الصفحات)
+    price_values = list(gold_results.values())
+    if len(price_values) != len(set(price_values)):
+        print(f"WARNING: duplicate gold prices detected across {list(gold_results.keys())} "
+              f"(values: {price_values}) — this is almost certainly a parsing mistake, not real prices. "
+              f"Skipping ALL gold price updates this run. Please verify the source URLs, or enter gold "
+              f"prices manually from the admin panel.", file=sys.stderr)
+        had_error = True
+        gold_results = {}
+
+    # -------- المرحلة 3: الإرسال الفعلي للموقع --------
+    for code, (buy, sell) in fx_results.items():
+        try:
+            print(f"[{code}] parsed -> buy: {buy}  sell: {sell}")
+            result = push_to_site(code, buy, sell)
             print(f"[{code}] site response:", result)
         except Exception as e:
-            print(f"ERROR updating '{code}': {e}", file=sys.stderr)
+            print(f"ERROR pushing '{code}': {e}", file=sys.stderr)
+            had_error = True
+
+    for code, price in gold_results.items():
+        try:
+            print(f"[{code}] parsed -> price: {price}")
+            result = push_to_site(code, None, price)
+            print(f"[{code}] site response:", result)
+        except Exception as e:
+            print(f"ERROR pushing '{code}': {e}", file=sys.stderr)
             had_error = True
 
     if had_error:
